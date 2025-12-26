@@ -12,113 +12,84 @@ const API_BASE = "https://theeduverse.xyz/api";
 app.use(cors());
 app.use(express.json());
 
-// --- SERVER SIDE CACHE LOGIC ---
-
-// Initialize cache file if it doesn't exist
+// --- CACHE MANAGEMENT ---
 if (!fs.existsSync(CACHE_FILE)) {
     fs.writeFileSync(CACHE_FILE, JSON.stringify({ completed: [] }));
 }
 
-// Helper to read cache
 const getCache = () => {
     try {
-        const data = fs.readFileSync(CACHE_FILE);
-        return JSON.parse(data);
+        return JSON.parse(fs.readFileSync(CACHE_FILE));
     } catch (e) {
         return { completed: [] };
     }
 };
 
-// Helper to write cache
 const saveCache = (data) => {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(data));
 };
 
-// --- API ENDPOINTS ---
+// --- SERVER SIDE API ENDPOINTS ---
 
-// 1. Get Batches (Proxy)
 app.get('/api/batches', async (req, res) => {
     try {
         const response = await axios.get(`${API_BASE}/batches`);
         res.json(response.data);
     } catch (error) {
+        console.error("Error fetching batches:", error.message);
         res.status(500).json({ error: 'Failed to fetch batches' });
     }
 });
 
-// 2. Get FULL Batch Data (Server-Side Aggregation)
-// This does the "Eager Loading" on the server
 app.get('/api/batch-full/:batchId', async (req, res) => {
     const { batchId } = req.params;
-    
     try {
-        // A. Get Subjects
         const subRes = await axios.get(`${API_BASE}/batches/${batchId}`);
         const subjects = subRes.data.data || [];
 
-        // B. Parallel Fetching of all content
-        // We map every subject to 3 requests (lectures, notes, dpps)
-        const allContentPromises = subjects.map(async (subject) => {
+        const allPromises = subjects.map(async (subject) => {
             const types = ['lectures', 'notes', 'dpps'];
-            
-            const typePromises = types.map(async (type) => {
+            const typeResults = await Promise.all(types.map(async (type) => {
                 try {
-                    const url = `${API_BASE}/${batchId}/subjects/${subject.id}/${type}`;
-                    const r = await axios.get(url);
+                    const r = await axios.get(`${API_BASE}/${batchId}/subjects/${subject.id}/${type}`);
                     return (r.data.data || []).map(item => ({
                         ...item,
                         _subjectName: subject.name,
                         _type: type
                     }));
-                } catch (e) {
-                    return [];
-                }
-            });
-
-            const results = await Promise.all(typePromises);
-            return results.flat();
+                } catch (e) { return []; }
+            }));
+            return typeResults.flat();
         });
 
-        const nestedResults = await Promise.all(allContentPromises);
-        const flatResults = nestedResults.flat();
-
-        res.json({ data: flatResults });
-
+        const nestedResults = await Promise.all(allPromises);
+        res.json({ data: nestedResults.flat() });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to aggregate batch data' });
+        res.status(500).json({ error: 'Failed to fetch batch details' });
     }
 });
 
-// 3. Get User Progress (Read Cache)
-app.get('/api/progress', (req, res) => {
-    const cache = getCache();
-    res.json(cache.completed);
-});
+app.get('/api/progress', (req, res) => res.json(getCache().completed));
 
-// 4. Mark Done (Write Cache)
 app.post('/api/mark-done', (req, res) => {
     const { id } = req.body;
-    if (!id) return res.status(400).send('Missing ID');
-
     const cache = getCache();
     if (!cache.completed.includes(id)) {
         cache.completed.push(id);
         saveCache(cache);
     }
-    res.json({ success: true, completed: cache.completed });
+    res.json({ success: true });
 });
 
-// 5. Mark Undone (Write Cache)
 app.post('/api/mark-undone', (req, res) => {
     const { id } = req.body;
     const cache = getCache();
     cache.completed = cache.completed.filter(item => item !== id);
     saveCache(cache);
-    res.json({ success: true, completed: cache.completed });
+    res.json({ success: true });
 });
 
-// --- SERVE FRONTEND (HTML) ---
+// --- FRONTEND UI ---
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
@@ -126,298 +97,170 @@ app.get('/', (req, res) => {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smarterz | Server Tracker</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    
+    <title>Smarterz | Server</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --primary: #8b5cf6; --secondary: #06b6d4; --success: #10b981;
-            --bg-dark: #09090b; --bg-surface: #18181b; --border: rgba(255, 255, 255, 0.08);
-            --text-main: #fafafa; --text-muted: #a1a1aa;
-        }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: var(--bg-dark); color: var(--text-main); min-height: 100vh; }
-        
-        /* Layout */
-        header {
-            position: sticky; top: 0; z-index: 100; background: rgba(9, 9, 11, 0.95);
-            border-bottom: 1px solid var(--border); padding: 1rem 5%;
-            display: flex; align-items: center; justify-content: space-between;
-        }
-        .brand {
-            font-family: 'Outfit', sans-serif; font-size: 1.5rem; font-weight: 700;
-            background: linear-gradient(135deg, #8b5cf6 0%, #3b82f6 100%);
-            -webkit-background-clip: text; -webkit-text-fill-color: transparent; cursor: pointer;
-        }
-        
-        /* Toggle Switch */
-        .settings-area { display: flex; align-items: center; gap: 10px; font-size: 0.9rem; }
-        .switch { position: relative; display: inline-block; width: 40px; height: 22px; }
-        .switch input { opacity: 0; width: 0; height: 0; }
-        .slider {
-            position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
-            background-color: #333; transition: .4s; border-radius: 34px;
-        }
-        .slider:before {
-            position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px;
-            background-color: white; transition: .4s; border-radius: 50%;
-        }
-        input:checked + .slider { background-color: var(--primary); }
-        input:checked + .slider:before { transform: translateX(18px); }
-
-        main { padding: 2rem 5%; max-width: 1200px; margin: 0 auto; }
-
-        /* Grid & Cards */
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 24px; }
-        .card {
-            background: var(--bg-surface); border: 1px solid var(--border); border-radius: 16px;
-            overflow: hidden; cursor: pointer; transition: 0.3s;
-        }
-        .card:hover { transform: translateY(-5px); border-color: var(--primary); }
-        .card-img { width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #222; }
-        .card-body { padding: 1.25rem; }
-
-        /* Dashboard */
-        .dash-tabs { display: flex; gap: 15px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
-        .dash-tab {
-            padding: 10px 20px; background: transparent; border: none; color: var(--text-muted);
-            font-size: 1.1rem; cursor: pointer; border-bottom: 2px solid transparent;
-        }
-        .dash-tab.active { color: white; border-bottom-color: var(--primary); }
-
-        /* Subject Groups */
-        .subject-group { margin-bottom: 15px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-surface); }
-        .subject-header { padding: 15px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
-        .subject-header:hover { background: rgba(255,255,255,0.02); }
-        .subject-content { display: none; padding: 0; border-top: 1px solid var(--border); }
-        .subject-group.open .subject-content { display: block; }
-
-        /* Items */
-        .content-item {
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 12px 20px; border-bottom: 1px solid rgba(255,255,255,0.03);
-        }
-        .content-item:last-child { border-bottom: none; }
-        .item-icon { color: var(--secondary); margin-right: 10px; width: 20px; text-align: center; }
-        
-        .btn {
-            padding: 6px 14px; border-radius: 6px; border: none; font-size: 0.8rem; cursor: pointer; font-weight: 600;
-        }
-        .btn-done { background: var(--primary); color: white; }
-        .btn-undo { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-        
-        .loading { text-align: center; padding: 40px; color: var(--text-muted); }
+        :root { --p: #8b5cf6; --bg: #09090b; --s: #18181b; --b: #27272a; --t: #fafafa; --tm: #a1a1aa; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--t); margin: 0; line-height: 1.5; }
+        header { position: sticky; top: 0; background: rgba(9,9,11,0.9); backdrop-filter: blur(8px); padding: 15px 5%; border-bottom: 1px solid var(--b); display: flex; justify-content: space-between; align-items: center; z-index: 10; }
+        .logo { font-weight: 700; font-size: 1.2rem; cursor: pointer; color: var(--p); }
+        .toggle-box { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; color: var(--tm); }
+        main { padding: 20px 5%; max-width: 900px; margin: 0 auto; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px; }
+        .card { background: var(--s); border: 1px solid var(--b); border-radius: 12px; padding: 15px; cursor: pointer; transition: 0.2s; }
+        .card:hover { border-color: var(--p); transform: translateY(-2px); }
+        .tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--b); margin-bottom: 20px; }
+        .tab { padding: 10px 5px; cursor: pointer; color: var(--tm); border-bottom: 2px solid transparent; }
+        .tab.active { color: var(--t); border-bottom-color: var(--p); }
+        .group { background: var(--s); border-radius: 10px; margin-bottom: 10px; overflow: hidden; border: 1px solid var(--b); }
+        .group-h { padding: 12px 15px; background: rgba(255,255,255,0.03); cursor: pointer; font-weight: 600; display: flex; justify-content: space-between; }
+        .item { padding: 10px 15px; border-top: 1px solid var(--b); display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; }
+        .btn { padding: 6px 12px; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; font-size: 0.75rem; }
+        .btn-done { background: var(--p); color: #fff; }
+        .btn-undo { background: #3f3f46; color: #d4d4d8; }
         .hidden { display: none !important; }
-
-        #toast {
-            position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
-            background: var(--success); color: white; padding: 10px 20px; border-radius: 20px;
-            display: none; box-shadow: 0 10px 20px rgba(0,0,0,0.3); z-index: 999;
-        }
+        .loading { text-align: center; padding: 50px; color: var(--tm); }
     </style>
 </head>
 <body>
-
     <header>
-        <div class="brand" onclick="location.reload()">Smarterz <span style="font-weight:300; font-size:0.7em;">| Server</span></div>
-        <div class="settings-area">
-            <span>Auto Copy Link</span>
-            <label class="switch">
-                <input type="checkbox" id="copyToggle" checked>
-                <span class="slider"></span>
-            </label>
+        <div class="logo" onclick="location.reload()">SMARTERZ</div>
+        <div class="toggle-box">
+            Auto-Copy <input type="checkbox" id="copyToggle" checked>
         </div>
     </header>
 
     <main id="app">
-        </main>
-
-    <div id="toast">Action Completed</div>
+        <div class="loading">Initializing...</div>
+    </main>
 
     <script>
-        const app = {
-            completedIds: [],
-            currentData: [],
+        let state = { completed: [], allData: [], currentBatch: '' };
+
+        async function init() {
+            const copySaved = localStorage.getItem('copyToggle');
+            if (copySaved !== null) document.getElementById('copyToggle').checked = copySaved === 'true';
+            document.getElementById('copyToggle').onchange = (e) => localStorage.setItem('copyToggle', e.target.checked);
             
-            init: async () => {
-                // Load Toggle State
-                const savedToggle = localStorage.getItem('autoCopy');
-                if(savedToggle !== null) document.getElementById('copyToggle').checked = (savedToggle === 'true');
+            await fetchProgress();
+            showBatches();
+        }
 
-                document.getElementById('copyToggle').addEventListener('change', (e) => {
-                    localStorage.setItem('autoCopy', e.target.checked);
-                });
+        async function fetchProgress() {
+            const r = await fetch('/api/progress');
+            state.completed = await r.json();
+        }
 
-                await app.fetchProgress();
-                app.loadBatches();
-            },
-
-            // 1. Fetch Server-Side Progress
-            fetchProgress: async () => {
-                try {
-                    const res = await fetch('/api/progress');
-                    app.completedIds = await res.json();
-                } catch(e) { console.error("Cache load failed"); }
-            },
-
-            // 2. Load Batches
-            loadBatches: async () => {
-                const container = document.getElementById('app');
-                container.innerHTML = '<div class="loading"><i class="fas fa-spinner fa-spin"></i> Loading Batches...</div>';
-                
-                const res = await fetch('/api/batches');
-                const json = await res.json();
-                
-                let html = '<div class="grid">';
-                (json.data || []).forEach(b => {
-                    html += \`
-                        <div class="card" onclick='app.loadBatchDetail("\${b.id}", "\${b.name}")'>
-                            <img src="\${b.imageUrl}" class="card-img">
-                            <div class="card-body"><h3>\${b.name}</h3></div>
-                        </div>\`;
-                });
-                container.innerHTML = html + '</div>';
-            },
-
-            // 3. Load Full Batch (Server Aggregation)
-            loadBatchDetail: async (id, name) => {
-                const container = document.getElementById('app');
-                container.innerHTML = \`<div class="loading">
-                    <h2>Loading \${name}...</h2>
-                    <p>Fetching all lectures, notes, and DPPs from server...</p>
-                    <br><i class="fas fa-circle-notch fa-spin fa-2x"></i>
+        async function showBatches() {
+            const app = document.getElementById('app');
+            app.innerHTML = '<div class="loading">Fetching Batches...</div>';
+            const r = await fetch('/api/batches');
+            const json = await r.json();
+            
+            let html = '<div class="grid">';
+            json.data.forEach(b => {
+                html += \`<div class="card" onclick="loadBatch('\${b.id}', '\${b.name.replace(/'/g, "")}')">
+                    <div style="font-weight:600">\${b.name}</div>
                 </div>\`;
+            });
+            app.innerHTML = html + '</div>';
+        }
 
-                try {
-                    const res = await fetch(\`/api/batch-full/\${id}\`);
-                    const json = await res.json();
-                    app.currentData = json.data;
-                    app.renderDashboard(name);
-                } catch(e) {
-                    container.innerHTML = '<div class="loading" style="color:red">Failed to load batch data.</div>';
-                }
-            },
+        async function loadBatch(id, name) {
+            state.currentBatch = name;
+            const app = document.getElementById('app');
+            app.innerHTML = \`<div class="loading">Loading all content for \${name}...<br><small>This may take a few seconds.</small></div>\`;
+            const r = await fetch('/api/batch-full/' + id);
+            const json = await r.json();
+            state.allData = json.data;
+            renderDashboard();
+        }
 
-            renderDashboard: (name) => {
-                const pending = app.currentData.filter(i => !app.completedIds.includes(i.id));
-                const completed = app.currentData.filter(i => app.completedIds.includes(i.id));
+        function renderDashboard() {
+            const pending = state.allData.filter(i => !state.completed.includes(i.id));
+            const done = state.allData.filter(i => state.completed.includes(i.id));
+            
+            document.getElementById('app').innerHTML = \`
+                <h2 style="margin-bottom:5px">\${state.currentBatch}</h2>
+                <div class="tabs">
+                    <div class="tab active" id="tabP" onclick="switchTab('P')">Pending (\${pending.length})</div>
+                    <div class="tab" id="tabD" onclick="switchTab('D')">Completed (\${done.length})</div>
+                </div>
+                <div id="viewP">\${renderList(pending, false)}</div>
+                <div id="viewD" class="hidden">\${renderList(done, true)}</div>
+            \`;
+        }
 
-                const container = document.getElementById('app');
-                container.innerHTML = \`
-                    <h2 style="margin-bottom:20px">\${name}</h2>
-                    <div class="dash-tabs">
-                        <button class="dash-tab active" onclick="app.switchTab('pending')">Pending (\${pending.length})</button>
-                        <button class="dash-tab" onclick="app.switchTab('completed')">Completed (\${completed.length})</button>
+        function renderList(items, isDone) {
+            if (items.length === 0) return '<div class="loading">Nothing here.</div>';
+            const groups = {};
+            items.forEach(i => {
+                if (!groups[i._subjectName]) groups[i._subjectName] = [];
+                groups[i._subjectName].push(i);
+            });
+
+            return Object.keys(groups).map(sub => \`
+                <div class="group">
+                    <div class="group-h" onclick="this.nextElementSibling.classList.toggle('hidden')">
+                        \${sub} <span>\${groups[sub].length}</span>
                     </div>
-                    <div id="view-pending">\${app.renderList(pending, false)}</div>
-                    <div id="view-completed" class="hidden">\${app.renderList(completed, true)}</div>
-                \`;
-            },
-
-            renderList: (items, isCompleted) => {
-                if(!items.length) return '<div class="loading">No items found here.</div>';
-                
-                // Group by Subject
-                const groups = {};
-                items.forEach(i => {
-                    if(!groups[i._subjectName]) groups[i._subjectName] = [];
-                    groups[i._subjectName].push(i);
-                });
-
-                let html = '';
-                Object.keys(groups).sort().forEach(sub => {
-                    html += \`
-                        <div class="subject-group">
-                            <div class="subject-header" onclick="this.parentElement.classList.toggle('open')">
-                                <strong>\${sub}</strong>
-                                <i class="fas fa-chevron-down"></i>
+                    <div>
+                        \${groups[sub].map(i => \`
+                            <div class="item">
+                                <div>
+                                    <div style="font-size:0.8rem; color:var(--tm); text-transform:uppercase;">\${i._type}</div>
+                                    \${i.title || i.name}
+                                </div>
+                                \${isDone 
+                                    ? \`<button class="btn btn-undo" onclick="markUndone('\${i.id}')">Undo</button>\`
+                                    : \`<button class="btn btn-done" onclick="markDone('\${i.id}', \\\`\${(i.title||i.name).replace(/'/g,"")}\\\`, '\${i.url || i.originalUrl}')">Done</button>\`
+                                }
                             </div>
-                            <div class="subject-content">
-                                \${groups[sub].map(item => {
-                                    const icon = item._type === 'lectures' ? 'fa-play' : (item._type === 'notes' ? 'fa-file' : 'fa-pencil');
-                                    // Escape quotes for onclick
-                                    const safeTitle = (item.title||item.name||'').replace(/'/g, "\\'");
-                                    const safeUrl = (item.url||item.originalUrl||'').replace(/'/g, "\\'");
+                        \`).join('')}
+                    </div>
+                </div>
+            \`).join('');
+        }
 
-                                    return \`
-                                        <div class="content-item">
-                                            <div style="flex:1">
-                                                <i class="fas \${icon} item-icon"></i> \${item.title || item.name}
-                                                <span style="font-size:0.7em; color:#666; margin-left:10px; text-transform:uppercase">\${item._type}</span>
-                                            </div>
-                                            \${isCompleted 
-                                                ? \`<button class="btn btn-undo" onclick="app.markUndone('\${item.id}')">Undo</button>\` 
-                                                : \`<button class="btn btn-done" onclick="app.markDone('\${item.id}', '\${safeTitle}', '\${safeUrl}')">Done</button>\`
-                                            }
-                                        </div>\`;
-                                }).join('')}
-                            </div>
-                        </div>\`;
-                });
-                return html;
-            },
+        function switchTab(type) {
+            document.getElementById('viewP').classList.toggle('hidden', type === 'D');
+            document.getElementById('viewD').classList.toggle('hidden', type === 'P');
+            document.getElementById('tabP').classList.toggle('active', type === 'P');
+            document.getElementById('tabD').classList.toggle('active', type === 'D');
+        }
 
-            switchTab: (tab) => {
-                document.querySelectorAll('.dash-tab').forEach(b => b.classList.remove('active'));
-                event.target.classList.add('active');
-                document.getElementById('view-pending').classList.add('hidden');
-                document.getElementById('view-completed').classList.add('hidden');
-                document.getElementById('view-'+tab).classList.remove('hidden');
-            },
-
-            markDone: async (id, title, url) => {
-                // 1. Check Copy Toggle
-                if(document.getElementById('copyToggle').checked) {
-                    app.copyLink(title, url);
+        async function markDone(id, title, url) {
+            if (document.getElementById('copyToggle').checked) {
+                let finalUrl = url;
+                if (finalUrl.includes('.m3u8')) {
+                    finalUrl = 'https://smarterz.netlify.app/player?url=' + encodeURIComponent(finalUrl);
                 }
-
-                // 2. Server Call
-                await fetch('/api/mark-done', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ id })
-                });
-
-                // 3. UI Update (Optimistic)
-                app.completedIds.push(id);
-                app.renderDashboard(document.querySelector('h2').innerText); // Re-render current view
-            },
-
-            markUndone: async (id) => {
-                await fetch('/api/mark-undone', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ id })
-                });
-                app.completedIds = app.completedIds.filter(x => x !== id);
-                app.renderDashboard(document.querySelector('h2').innerText);
-            },
-
-            copyLink: (title, rawUrl) => {
-                let finalUrl = rawUrl;
-                if (/\/(\\d+)_(\\d+)\\.m3u8$/.test(finalUrl)) finalUrl = finalUrl.replace(/\/(\\d+)_(\\d+)\\.m3u8$/, "/index_1.m3u8");
-                if (finalUrl.includes('.m3u8')) finalUrl = \`https://smarterz.netlify.app/player?url=\${encodeURIComponent(finalUrl)}\`;
-                
-                navigator.clipboard.writeText(\`\${title}: \${finalUrl}\`);
-                app.showToast('Copied & Marked Done!');
-            },
-
-            showToast: (msg) => {
-                const t = document.getElementById('toast');
-                t.innerText = msg;
-                t.style.display = 'block';
-                setTimeout(()=>t.style.display='none', 2000);
+                navigator.clipboard.writeText(title + ': ' + finalUrl);
             }
-        };
+            await fetch('/api/mark-done', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id })
+            });
+            state.completed.push(id);
+            renderDashboard();
+        }
 
-        app.init();
+        async function markUndone(id) {
+            await fetch('/api/mark-undone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id })
+            });
+            state.completed = state.completed.filter(x => x !== id);
+            renderDashboard();
+        }
+
+        init();
     </script>
 </body>
 </html>
     `);
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log('Server running on port ' + PORT));
